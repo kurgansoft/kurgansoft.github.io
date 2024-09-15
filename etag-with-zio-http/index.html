@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+      <meta http-equiv="X-UA-Compatible" content="IE=edge">
+      <meta http-equiv="content-type" content="text/html; charset=utf-8">
+
+      <!-- Enable responsiveness on mobile devices-->
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    
+      
+    
+
+      <title></title>
+
+      
+
+      
+          <link rel="stylesheet" href="https://kurgansoft.github.io/site.css">
+      
+
+      
+      
+    </head>
+
+    <body class="hack dark main container">
+        
+    
+        
+                
+            
+    
+
+<article itemscope itemtype="http://schema.org/BlogPosting">
+    <header>
+        <h1 itemprop="headline">ZIO-HTTP and the ETag header</h1>
+        <span class="muted">
+    <svg class="icon i-clock" viewBox="0 0 32 32"
+         width="16" height="16" fill="none" stroke="currentcolor"
+         stroke-linecap="round" stroke-linejoin="round" stroke-width="6.25%">
+        <circle cx="16" cy="16" r="14"/>
+        <path d="M16 8 L16 16 20 20"/>
+    </svg>
+    <span>8 minute read</span>
+    <svg class="icon i-edit" viewBox="0 0 32 32"
+         width="16" height="16" fill="none" stroke="currentcolor"
+         stroke-linecap="round" stroke-linejoin="round" stroke-width="6.25%">
+        <path d="M30 7 L25 2 5 22 3 29 10 27 Z M21 6 L26 11 Z M5 22 L10 27 Z"/>
+    </svg>
+
+    Published: 2024-09-15
+</span>
+    </header>
+    <div itemprop="articleBody">
+      <h1 id="introduction">Introduction</h1>
+<p>In this article, I will showcase a simple HTTP application that uses the zio-http library.
+First, we will look at the business problem, implement a naive solution, then add some optimization with ETag headers.</p>
+<p>The code is available <a href="https://github.com/kurgansoft/etag-example">here</a>.</p>
+<p>Let's get started!</p>
+<h1 id="first-steps">First steps</h1>
+<p>Let's say we want to create a mobile app that allows users to place their orders in restaurants using their phones.</p>
+<p>In order to display a nice-looking UI that can be used to create an order, first, we need to fetch the menu.</p>
+<p>So, let's start by modeling the menu:</p>
+<pre data-lang="scala" style="background-color:#2b303b;color:#c0c5ce;" class="language-scala "><code class="language-scala" data-lang="scala"><span style="color:#b48ead;">case class</span><span style="color:#ebcb8b;"> Catalogue</span><span>(</span><span style="color:#bf616a;">version</span><span>: </span><span style="color:#b48ead;">Int</span><span>, </span><span style="color:#bf616a;">items</span><span>: </span><span style="color:#ebcb8b;">Map</span><span>[</span><span style="color:#ebcb8b;">String</span><span>, </span><span style="color:#b48ead;">Int</span><span>])
+</span></code></pre>
+<p>The Catalogue class is quite minimal; it only contains the available items with their prices in a Map, and the version. For a real implementation, we would probably need more details, but it is good enough for our example.</p>
+<p>Also, we need to generate a schema in the companion object. (More on that later.)</p>
+<pre data-lang="scala" style="background-color:#2b303b;color:#c0c5ce;" class="language-scala "><code class="language-scala" data-lang="scala"><span style="color:#b48ead;">object</span><span style="color:#ebcb8b;"> Catalogue </span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">  </span><span style="color:#b48ead;">implicit val </span><span style="color:#bf616a;">schema</span><span style="color:#eff1f5;">: </span><span style="color:#ebcb8b;">Schema</span><span style="color:#eff1f5;">[</span><span style="color:#ebcb8b;">Catalogue</span><span style="color:#eff1f5;">] </span><span>= </span><span style="color:#eff1f5;">DeriveSchema.gen
+</span><span style="color:#eff1f5;">}
+</span></code></pre>
+<p>As a next step, we will create a <a href="https://zio.dev/zio-http/reference/endpoint">declarative endpoint</a> which will be used to fetch the latest catalogue:</p>
+<pre data-lang="scala" style="background-color:#2b303b;color:#c0c5ce;" class="language-scala "><code class="language-scala" data-lang="scala"><span style="color:#b48ead;">val </span><span style="color:#bf616a;">getCatalogue</span><span>: </span><span style="color:#ebcb8b;">Endpoint</span><span>[</span><span style="color:#b48ead;">Unit</span><span>, </span><span style="color:#b48ead;">Unit</span><span>, </span><span style="color:#ebcb8b;">ZNothing</span><span>, </span><span style="color:#ebcb8b;">Catalogue</span><span>, </span><span style="color:#ebcb8b;">None</span><span>] = 
+</span><span>    Endpoint(RoutePattern.GET / &quot;</span><span style="color:#a3be8c;">catalogue</span><span>&quot;)
+</span><span>        .outCodec(StatusCodec.Ok ++ HttpCodec.content[</span><span style="color:#ebcb8b;">Catalogue</span><span>])
+</span></code></pre>
+<p>The above represents a GET endpoint with path 'catalogue' that responds with 200 and returns a JSON object.
+Because we have created the schema for the Catalogue class, we'll be able to use Catalogue scala objects in our implementation, the conversion to JSON will be taken care of automatically.</p>
+<h1 id="implementing-the-server">Implementing the server</h1>
+<p>So let's implement the server so we can use our favorite http client to retrieve the catalogue!</p>
+<p>The implementation that transforms this Endpoint to a Route object:</p>
+<pre data-lang="scala" style="background-color:#2b303b;color:#c0c5ce;" class="language-scala "><code class="language-scala" data-lang="scala"><span style="color:#b48ead;">private</span><span>[server] </span><span style="color:#b48ead;">val </span><span style="color:#bf616a;">getCatalogueRoute</span><span>: </span><span style="color:#ebcb8b;">Route</span><span>[</span><span style="color:#ebcb8b;">Ref</span><span>[</span><span style="color:#ebcb8b;">Catalogue</span><span>], </span><span style="color:#b48ead;">Nothing</span><span>] = 
+</span><span>  EndpointDefinitions.getCatalogue.implement(</span><span style="color:#bf616a;">_ </span><span style="color:#b48ead;">=&gt;
+</span><span>    </span><span style="color:#b48ead;">for </span><span>{
+</span><span>      </span><span style="color:#bf616a;">ref </span><span>&lt;- ZIO.service[</span><span style="color:#ebcb8b;">Ref</span><span>[</span><span style="color:#ebcb8b;">Catalogue</span><span>]]
+</span><span>      </span><span style="color:#bf616a;">currentCatalogue </span><span>&lt;- ref.get
+</span><span>    } </span><span style="color:#b48ead;">yield</span><span> currentCatalogue
+</span><span>  )
+</span></code></pre>
+<p>We are using a <a href="https://zio.dev/reference/concurrency/ref/">Ref</a> here to get access to the current Catalogue.
+It also means that later we'll need to provide this environment to the Route before we can use it.</p>
+<p>So we'll need an effect that periodically updates this Ref with the latest Catalogue object. To have some sample data I have asked ChatGPT to generate 25 food items with their prices in HUF. This is the result:</p>
+<pre data-lang="scala" style="background-color:#2b303b;color:#c0c5ce;" class="language-scala "><code class="language-scala" data-lang="scala"><span style="color:#b48ead;">val </span><span style="color:#bf616a;">hardcodedItems</span><span>: </span><span style="color:#ebcb8b;">Seq</span><span>[(</span><span style="color:#ebcb8b;">String</span><span>, </span><span style="color:#b48ead;">Int</span><span>)] = Seq(
+</span><span>    &quot;</span><span style="color:#a3be8c;">Pizza Margherita</span><span>&quot; -&gt; </span><span style="color:#d08770;">1500</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Cheeseburger</span><span>&quot; -&gt; </span><span style="color:#d08770;">1200</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Spaghetti Carbonara</span><span>&quot; -&gt; </span><span style="color:#d08770;">1800</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Caesar Salad</span><span>&quot; -&gt; </span><span style="color:#d08770;">1600</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Club Sandwich</span><span>&quot; -&gt; </span><span style="color:#d08770;">1400</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Chicken Soup</span><span>&quot; -&gt; </span><span style="color:#d08770;">800</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Grilled Sirloin Steak</span><span>&quot; -&gt; </span><span style="color:#d08770;">3500</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Fish and Chips</span><span>&quot; -&gt; </span><span style="color:#d08770;">2200</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Sushi Platter</span><span>&quot; -&gt; </span><span style="color:#d08770;">4000</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Tonkotsu Ramen</span><span>&quot; -&gt; </span><span style="color:#d08770;">2500</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Chicken Curry</span><span>&quot; -&gt; </span><span style="color:#d08770;">1900</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Beef Tacos</span><span>&quot; -&gt; </span><span style="color:#d08770;">1200</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Loaded Nachos</span><span>&quot; -&gt; </span><span style="color:#d08770;">1300</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Charcuterie Board</span><span>&quot; -&gt; </span><span style="color:#d08770;">3000</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Gelato Trio</span><span>&quot; -&gt; </span><span style="color:#d08770;">900</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Chocolate Lava Cake</span><span>&quot; -&gt; </span><span style="color:#d08770;">1100</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Apple Pie</span><span>&quot; -&gt; </span><span style="color:#d08770;">900</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Bruschetta</span><span>&quot; -&gt; </span><span style="color:#d08770;">800</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Garlic Bread</span><span>&quot; -&gt; </span><span style="color:#d08770;">700</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Goulash</span><span>&quot; -&gt; </span><span style="color:#d08770;">1700</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Beef Stroganoff</span><span>&quot; -&gt; </span><span style="color:#d08770;">2600</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Pierogi</span><span>&quot; -&gt; </span><span style="color:#d08770;">1300</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Ratatouille</span><span>&quot; -&gt; </span><span style="color:#d08770;">1500</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Fried Chicken</span><span>&quot; -&gt; </span><span style="color:#d08770;">2500</span><span>,
+</span><span>    &quot;</span><span style="color:#a3be8c;">Vegetable Stir Fry</span><span>&quot; -&gt; </span><span style="color:#d08770;">1600
+</span><span>)
+</span></code></pre>
+<p>The idea is that we'll have an effect that updates this Ref every half second with a new Catalogue object derived from the above dataset.</p>
+<pre data-lang="scala" style="background-color:#2b303b;color:#c0c5ce;" class="language-scala "><code class="language-scala" data-lang="scala"><span style="color:#b48ead;">private val </span><span style="color:#bf616a;">updateCatalogueEffect</span><span>: </span><span style="color:#ebcb8b;">ZIO</span><span>[</span><span style="color:#ebcb8b;">Ref</span><span>[</span><span style="color:#ebcb8b;">Catalogue</span><span>], </span><span style="color:#b48ead;">Nothing</span><span>, </span><span style="color:#b48ead;">Unit</span><span>] = </span><span style="color:#b48ead;">for </span><span>{
+</span><span>    </span><span style="color:#bf616a;">catalogueRef </span><span>&lt;- ZIO.service[</span><span style="color:#ebcb8b;">Ref</span><span>[</span><span style="color:#ebcb8b;">Catalogue</span><span>]]
+</span><span>    </span><span style="color:#bf616a;">_ </span><span>&lt;- ZIO.foreachDiscard(</span><span style="color:#d08770;">1</span><span> to CatalogueGenerator.size) {
+</span><span>      </span><span style="color:#bf616a;">round </span><span style="color:#b48ead;">=&gt;
+</span><span>        </span><span style="color:#b48ead;">for </span><span>{
+</span><span>          </span><span style="color:#bf616a;">_ </span><span>&lt;- catalogueRef.set(CatalogueGenerator.data(round))
+</span><span>          </span><span style="color:#bf616a;">_ </span><span>&lt;- ZIO.sleep(Duration.fromMillis(</span><span style="color:#d08770;">500</span><span>))
+</span><span>        } </span><span style="color:#b48ead;">yield </span><span style="color:#d08770;">()
+</span><span>    }
+</span><span>  } </span><span style="color:#b48ead;">yield </span><span style="color:#d08770;">()
+</span></code></pre>
+<p>Link to <a href="https://github.com/kurgansoft/etag-example/blob/master/src/main/scala/etag_demo/server/CatalogueGenerator.scala">CatalogueGenerator</a>.</p>
+<p>After 25 iteration the Catalogue object will no longer be updated, so we will need one more endpoint to reset this process:</p>
+<pre data-lang="scala" style="background-color:#2b303b;color:#c0c5ce;" class="language-scala "><code class="language-scala" data-lang="scala"><span style="color:#b48ead;">val </span><span style="color:#bf616a;">reset</span><span>: </span><span style="color:#ebcb8b;">Endpoint</span><span>[</span><span style="color:#b48ead;">Unit</span><span>, </span><span style="color:#b48ead;">Unit</span><span>, </span><span style="color:#ebcb8b;">ZNothing</span><span>, </span><span style="color:#b48ead;">Unit</span><span>, </span><span style="color:#ebcb8b;">None</span><span>] = 
+</span><span>  Endpoint(RoutePattern.POST / &quot;</span><span style="color:#a3be8c;">reset</span><span>&quot;)
+</span><span>    .out[</span><span style="color:#b48ead;">Unit</span><span>].outCodec[</span><span style="color:#b48ead;">Unit</span><span>](HttpCodec.empty)
+</span></code></pre>
+<p>Now we can implement the server:</p>
+<pre data-lang="scala" style="background-color:#2b303b;color:#c0c5ce;" class="language-scala "><code class="language-scala" data-lang="scala"><span style="color:#b48ead;">override def </span><span style="color:#8fa1b3;">run</span><span>: </span><span style="color:#ebcb8b;">ZIO</span><span>[</span><span style="color:#ebcb8b;">Scope</span><span>, </span><span style="color:#ebcb8b;">Throwable</span><span>, </span><span style="color:#b48ead;">Unit</span><span>] = </span><span style="color:#b48ead;">for </span><span>{
+</span><span>    </span><span style="color:#bf616a;">catalogueRef </span><span>&lt;- Ref.make(CatalogueGenerator.data(</span><span style="color:#d08770;">1</span><span>))
+</span><span>    </span><span style="color:#bf616a;">updateFiberId </span><span>&lt;- updateCatalogueEffect.provideEnvironment(ZEnvironment(catalogueRef)).fork
+</span><span>    </span><span style="color:#bf616a;">fiberIdRef </span><span>&lt;- Ref.make(updateFiberId)
+</span><span>    </span><span style="color:#bf616a;">routes </span><span>= Routes(getCatalogueRoute, resetRoute).provideEnvironment(ZEnvironment(catalogueRef).add(fiberIdRef))
+</span><span>    </span><span style="color:#bf616a;">_ </span><span>&lt;- Server.serve(routes).provide(Server.default)
+</span><span>    </span><span style="color:#bf616a;">_ </span><span>&lt;- ZIO.never
+</span><span>  } </span><span style="color:#b48ead;">yield </span><span style="color:#d08770;">()
+</span></code></pre>
+<p>I have omitted the implementation of the resetRoute, but you can check it out <a href="https://github.com/kurgansoft/etag-example/blob/a44710784f48e47a5e42c55fed9f94fee2937ab2/src/main/scala/etag_demo/server/Main.scala">here</a>.
+We are creating a Routes object from our two routes, providing the missing dependencies then launching the Server with default parameters.</p>
+<h1 id="invoking-the-endpoint">Invoking the endpoint</h1>
+<p>At this stage our application is working, we can launch Main.scala. I'm using <a href="https://www.usebruno.com/">Bruno</a> to do some exploratory testing.</p>
+<p>We can use the reset endpoint to start with catalogue version 1:</p>
+<p><img src="/reset.png" alt="" /></p>
+<p>Then depending on when we invoke the GET endpoint we get back a catalogue with a version between 1 and 25:</p>
+<p><img src="/get.png" alt="" /></p>
+<h1 id="creating-a-client">Creating a client</h1>
+<p>At the beginning of this article, we mentioned that we need to fetch the catalogue to display a UI. If we have retrieved it already, it is possible that it is not the latest version.</p>
+<p>We have defined our endpoints with the high level Endpoint API, and with that it is quite straightforward to use those endpoints from a client.</p>
+<p>We just need to import the Endpoint definitions:</p>
+<pre data-lang="scala" style="background-color:#2b303b;color:#c0c5ce;" class="language-scala "><code class="language-scala" data-lang="scala"><span style="color:#b48ead;">import</span><span> etag_demo.common.EndpointDefinitions.{getCatalogue, reset}
+</span></code></pre>
+<p>Then we can create an endpoint executor:</p>
+<pre data-lang="scala" style="background-color:#2b303b;color:#c0c5ce;" class="language-scala "><code class="language-scala" data-lang="scala"><span>executor &lt;- ZIO.service[</span><span style="color:#ebcb8b;">EndpointExecutor</span><span>[</span><span style="color:#b48ead;">Any</span><span>, </span><span style="color:#b48ead;">Unit</span><span>]]
+</span></code></pre>
+<p>And with the executor we can call the endpoints in RPC style:</p>
+<pre data-lang="scala" style="background-color:#2b303b;color:#c0c5ce;" class="language-scala "><code class="language-scala" data-lang="scala"><span style="color:#bf616a;">_</span><span> &lt;- executor(reset())
+</span><span>latestCatalogue &lt;- executor(getCatalogue())
+</span></code></pre>
+<p>The first line returns Unit, while the second one yields a Catalogue. No need for manual conversions from HTTP responses, or parsing JSON manually.</p>
+<p>Below is the extract from <a href="https://github.com/kurgansoft/etag-example/blob/master/src/main/scala/etag_demo/client/Client1.scala">Client1</a> which retrieves the Catalogue 250 times and checks how many times we received the same value we already had:</p>
+<pre data-lang="scala" style="background-color:#2b303b;color:#c0c5ce;" class="language-scala "><code class="language-scala" data-lang="scala"><span style="color:#b48ead;">object</span><span style="color:#ebcb8b;"> Client1 </span><span style="color:#b48ead;">extends </span><span style="color:#a3be8c;">ZIOAppDefault </span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">  </span><span style="color:#b48ead;">override def </span><span style="color:#8fa1b3;">run</span><span style="color:#eff1f5;">: </span><span style="color:#ebcb8b;">ZIO</span><span style="color:#eff1f5;">[</span><span style="color:#ebcb8b;">Scope</span><span style="color:#eff1f5;">, </span><span style="color:#b48ead;">Unit</span><span style="color:#eff1f5;">, </span><span style="color:#b48ead;">Unit</span><span style="color:#eff1f5;">] </span><span>= </span><span style="color:#eff1f5;">(</span><span style="color:#b48ead;">for </span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">    </span><span style="color:#bf616a;">executor </span><span>&lt;- </span><span style="color:#eff1f5;">ZIO.service[</span><span style="color:#ebcb8b;">EndpointExecutor</span><span style="color:#eff1f5;">[</span><span style="color:#b48ead;">Any</span><span style="color:#eff1f5;">, </span><span style="color:#b48ead;">Unit</span><span style="color:#eff1f5;">]]
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">    </span><span style="color:#bf616a;">_ </span><span>&lt;- </span><span style="color:#eff1f5;">ZIO.log(</span><span>&quot;</span><span style="color:#a3be8c;">calling reset endpoint</span><span>&quot;</span><span style="color:#eff1f5;">)
+</span><span style="color:#eff1f5;">    </span><span style="color:#bf616a;">_ </span><span>&lt;-</span><span style="color:#eff1f5;"> executor(reset())
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">    </span><span style="color:#bf616a;">catalogueRef </span><span>&lt;- </span><span style="color:#eff1f5;">Ref.make[</span><span style="color:#ebcb8b;">Option</span><span style="color:#eff1f5;">[</span><span style="color:#ebcb8b;">Catalogue</span><span style="color:#eff1f5;">]](None)
+</span><span style="color:#eff1f5;">    </span><span style="color:#bf616a;">noOfBandwidthWastingCalls </span><span>&lt;- </span><span style="color:#eff1f5;">Ref.make[</span><span style="color:#b48ead;">Int</span><span style="color:#eff1f5;">](</span><span style="color:#d08770;">0</span><span style="color:#eff1f5;">)
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">    </span><span style="color:#bf616a;">_ </span><span>&lt;- </span><span style="color:#eff1f5;">ZIO.foreachDiscard(</span><span style="color:#d08770;">1</span><span style="color:#eff1f5;"> to </span><span style="color:#d08770;">250</span><span style="color:#eff1f5;">)(</span><span style="color:#bf616a;">_ </span><span style="color:#b48ead;">=&gt; for </span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">      </span><span style="color:#bf616a;">latestCatalogue </span><span>&lt;-</span><span style="color:#eff1f5;"> executor(getCatalogue())
+</span><span style="color:#eff1f5;">      </span><span style="color:#bf616a;">_ </span><span>&lt;- </span><span style="color:#eff1f5;">ZIO.log(</span><span>&quot;</span><span style="color:#a3be8c;">The latest catalogue retrieved: </span><span>&quot;</span><span style="color:#eff1f5;"> + latestCatalogue)
+</span><span style="color:#eff1f5;">      </span><span style="color:#bf616a;">currentCatalogue </span><span>&lt;-</span><span style="color:#eff1f5;"> catalogueRef.get
+</span><span style="color:#eff1f5;">      </span><span style="color:#bf616a;">_ </span><span>&lt;- </span><span style="color:#b48ead;">if </span><span style="color:#eff1f5;">(currentCatalogue.exists(</span><span style="color:#bf616a;">_</span><span style="color:#eff1f5;">.version </span><span>==</span><span style="color:#eff1f5;"> latestCatalogue.version))
+</span><span style="color:#eff1f5;">        noOfBandwidthWastingCalls.update(</span><span style="color:#bf616a;">_</span><span style="color:#eff1f5;"> + </span><span style="color:#d08770;">1</span><span style="color:#eff1f5;">) *&gt; ZIO.log(</span><span style="color:#96b5b4;">s</span><span>&quot;</span><span style="color:#a3be8c;">Seems like we have fetched catalogue with version [${</span><span style="color:#eff1f5;">latestCatalogue.version</span><span style="color:#a3be8c;">}], but we had that one already.</span><span>&quot;</span><span style="color:#eff1f5;">)
+</span><span style="color:#eff1f5;">      </span><span style="color:#b48ead;">else
+</span><span style="color:#eff1f5;">        catalogueRef.set(Some(latestCatalogue))
+</span><span style="color:#eff1f5;">      </span><span style="color:#bf616a;">_ </span><span>&lt;- </span><span style="color:#eff1f5;">ZIO.sleep(zio.Duration.fromMillis(</span><span style="color:#d08770;">50</span><span style="color:#eff1f5;">))
+</span><span style="color:#eff1f5;">    } </span><span style="color:#b48ead;">yield </span><span style="color:#d08770;">()</span><span style="color:#eff1f5;">)
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">    </span><span style="color:#bf616a;">noOfBandwidthWastingCallsAsNumber </span><span>&lt;-</span><span style="color:#eff1f5;"> noOfBandwidthWastingCalls.get
+</span><span style="color:#eff1f5;">    </span><span style="color:#bf616a;">_ </span><span>&lt;- </span><span style="color:#eff1f5;">ZIO.log(</span><span style="color:#96b5b4;">s</span><span>&quot;</span><span style="color:#96b5b4;">\n\t</span><span style="color:#a3be8c;">We have executed </span><span style="color:#bf616a;">$noOfBandwidthWastingCallsAsNumber</span><span style="color:#a3be8c;"> bandwidth wasting calls.</span><span>&quot;</span><span style="color:#eff1f5;">)
+</span><span style="color:#eff1f5;">  } </span><span style="color:#b48ead;">yield </span><span style="color:#d08770;">()</span><span style="color:#eff1f5;">).provide(
+</span><span style="color:#eff1f5;">    EndpointExecutor.make(serviceName </span><span>= &quot;</span><span style="color:#a3be8c;">server</span><span>&quot;</span><span style="color:#eff1f5;">).orDie,
+</span><span style="color:#eff1f5;">    Client.default.orDie,
+</span><span style="color:#eff1f5;">    Scope.default,
+</span><span style="color:#eff1f5;">  )
+</span><span style="color:#eff1f5;">}
+</span></code></pre>
+<p>In order to run the above successfully we need to set the <strong>SERVER_URL</strong> env variable like <strong>SERVER_URL=http://localhost:8080</strong>.</p>
+<p>After a successful run, we will have the following message:</p>
+<blockquote>
+<p>We have executed 225 bandwidth wasting calls.</p>
+</blockquote>
+<p>It is no surprise since we have 25 version of the catalogue so we can only retrieve a new version at most 25 times. So 250-25=225 times we just retrieve the version that we already had.</p>
+<h1 id="fixing-the-problem-with-etag">Fixing the problem with ETag</h1>
+<p>The previous approach solves the problem, but not in an efficient way. We could use Server-Sent Events, but that is a topic for another day.</p>
+<p>What we would like to do is to tell the server the version that we already have, and in case it did not change we get a reply that it was not modified and an empty body. In case it is not the current version, we will retrieve that just as before.</p>
+<p>We can achieve the above using the <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/If-None-Match">If-None-Match</a> request header and the <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/ETag">ETag</a> response header.</p>
+<p>So let's create a new endpoint definition with those two:</p>
+<pre data-lang="scala" style="background-color:#2b303b;color:#c0c5ce;" class="language-scala "><code class="language-scala" data-lang="scala"><span style="color:#b48ead;">val </span><span style="color:#bf616a;">getCatalogueWithETag</span><span>: </span><span style="color:#ebcb8b;">Endpoint</span><span>[</span><span style="color:#b48ead;">Unit</span><span>, </span><span style="color:#ebcb8b;">Option</span><span>[</span><span style="color:#ebcb8b;">Header</span><span>.</span><span style="color:#ebcb8b;">IfNoneMatch</span><span>], </span><span style="color:#ebcb8b;">ZNothing</span><span>, </span><span style="color:#ebcb8b;">Either</span><span>[</span><span style="color:#ebcb8b;">Header</span><span>.</span><span style="color:#ebcb8b;">ETag</span><span>, (</span><span style="color:#ebcb8b;">Catalogue</span><span>, </span><span style="color:#ebcb8b;">Header</span><span>.</span><span style="color:#ebcb8b;">ETag</span><span>)], </span><span style="color:#ebcb8b;">None</span><span>] =
+</span><span>  Endpoint(RoutePattern.GET / &quot;</span><span style="color:#a3be8c;">catalogueWithETag</span><span>&quot;)
+</span><span>    .inCodec(HeaderCodec.ifNoneMatch.optional)
+</span><span>    .outCodec(StatusCodec.Ok ++ HttpCodec.content[</span><span style="color:#ebcb8b;">Catalogue</span><span>] ++ HttpCodec.header(Header.ETag))
+</span><span>    .outCodec(StatusCodec.NotModified ++ HttpCodec.header(Header.ETag))
+</span></code></pre>
+<p>So what has changed compared to the previous endpoint? Now we have an input value: <strong>Option[Header.IfNoneMatch]</strong>, which means - no surprise - it can optionally take an If-None-Match header.
+We are using the outCodec method two times, that is why the response type is an Either. The first represents a reply with a Catalogue object and an <strong>ETag</strong> header, while the second one the <strong>ETag</strong> header alone.</p>
+<p>We can think about the ETag as a hash function for the resource. In this case we will just use the version number as the ETag value.</p>
+<p>Server implementation for the new endpoint:</p>
+<pre data-lang="scala" style="background-color:#2b303b;color:#c0c5ce;" class="language-scala "><code class="language-scala" data-lang="scala"><span style="color:#b48ead;">private</span><span>[server] </span><span style="color:#b48ead;">val </span><span style="color:#bf616a;">getCatalogueRouteWithETag</span><span>: 
+</span><span>  </span><span style="color:#ebcb8b;">Route</span><span>[</span><span style="color:#ebcb8b;">Ref</span><span>[</span><span style="color:#ebcb8b;">Catalogue</span><span>], </span><span style="color:#b48ead;">Nothing</span><span>] = 
+</span><span>    EndpointDefinitions.getCatalogueWithETag.implement(</span><span style="color:#bf616a;">nonMatchHeader </span><span style="color:#b48ead;">=&gt;
+</span><span>      </span><span style="color:#b48ead;">for </span><span>{
+</span><span>        </span><span style="color:#bf616a;">ifNonMatchValue </span><span>&lt;- nonMatchHeader </span><span style="color:#b48ead;">match </span><span>{
+</span><span>          </span><span style="color:#b48ead;">case </span><span>Some(</span><span style="color:#bf616a;">headerValue</span><span>) </span><span style="color:#b48ead;">=&gt;
+</span><span>            zio.Console.printLine(&quot;</span><span style="color:#a3be8c;">If-None-Match header is present: </span><span>&quot; + headerValue).orDie.as(Some(headerValue.renderedValue))
+</span><span>          </span><span style="color:#b48ead;">case </span><span style="color:#bf616a;">_ </span><span style="color:#b48ead;">=&gt;</span><span> zio.Console.printLine(&quot;</span><span style="color:#a3be8c;">If-None-Match header is not present.</span><span>&quot;).orDie.as(None)
+</span><span>        }
+</span><span>        </span><span style="color:#bf616a;">ref </span><span>&lt;- ZIO.service[</span><span style="color:#ebcb8b;">Ref</span><span>[</span><span style="color:#ebcb8b;">Catalogue</span><span>]]
+</span><span>        </span><span style="color:#bf616a;">currentCatalogue </span><span>&lt;- ref.get
+</span><span>        </span><span style="color:#bf616a;">s304 </span><span>= ifNonMatchValue.contains(currentCatalogue.version.toString)
+</span><span>        </span><span style="color:#bf616a;">_ </span><span>&lt;- zio.Console.printLine(&quot;</span><span style="color:#a3be8c;">s304: </span><span>&quot; + s304).orDie
+</span><span>        </span><span style="color:#bf616a;">etag </span><span>= Strong(currentCatalogue.version.toString)
+</span><span>        </span><span style="color:#bf616a;">toReturn </span><span>= </span><span style="color:#b48ead;">if </span><span>(s304) Left(etag) </span><span style="color:#b48ead;">else </span><span>Right((currentCatalogue, etag))
+</span><span>        </span><span style="color:#bf616a;">_ </span><span>&lt;- zio.Console.printLine(&quot;</span><span style="color:#a3be8c;">About to reply with: </span><span>&quot; + toReturn).orDie
+</span><span>      } </span><span style="color:#b48ead;">yield</span><span> toReturn
+</span><span>    )
+</span></code></pre>
+<p>We just check if the <strong>If-None-Match</strong> header is present, and if it is, it has the same version number that the actual Catalogue object has. If yes, we return with a Left value, otherwise with a Right.</p>
+<h1 id="client-that-sends-the-etag-value">Client that sends the ETag value</h1>
+<p>Now, we can create a new Client that uses this new endpoint. We're doing pretty much the same thing as before, but now we are holding on to the previous ETag value and using it in subsequent requests. You can check the implementation <a href="https://github.com/kurgansoft/etag-example/blob/master/src/main/scala/etag_demo/client/Client2.scala">here</a>.</p>
+<p>After executing it we get the message:</p>
+<blockquote>
+<p>We have saved some bandwidth 225 times.</p>
+</blockquote>
+<h1 id="testing">Testing</h1>
+<p>We have done some exploratory testing with an HTTP client, and written a client app for both the endpoints. But it would be nice to have a test that we can run on CI and shows that our endpoints behave the way they should.</p>
+<p>Let's focus on our second endpoint, more precisely the Route we create from it.
+So what do we want to assert? Basically three things:</p>
+<ul>
+<li>when request DOES NOT contain header 'If-None-Match' - we always get back the actual content</li>
+<li>when request DOES contain header 'If-None-Match' and it is the same as the Etag of the response - we get back 304 and empty body</li>
+<li>when request DOES contain header 'If-None-Match' but it is different than the Etag of the response - we get back 200 and the actual body</li>
+</ul>
+<p>In each of those cases we don't really care what the content is - we just want to get that back. In other words we can say that if the server has a given content, we want the described behavior.</p>
+<p>Therefore we can utilize <a href="https://zio.dev/reference/test/property-testing/">property based testing</a>. First we create a <a href="https://zio.dev/reference/test/property-testing/how-generators-work">Generator</a> for the Catalogue class:</p>
+<pre data-lang="scala" style="background-color:#2b303b;color:#c0c5ce;" class="language-scala "><code class="language-scala" data-lang="scala"><span style="color:#b48ead;">def </span><span style="color:#8fa1b3;">mapGenerator</span><span>(</span><span style="color:#bf616a;">numberOfItems</span><span>: </span><span style="color:#b48ead;">Int</span><span>): </span><span style="color:#ebcb8b;">Gen</span><span>[</span><span style="color:#b48ead;">Any</span><span>, </span><span style="color:#ebcb8b;">Map</span><span>[</span><span style="color:#ebcb8b;">String</span><span>, </span><span style="color:#b48ead;">Int</span><span>]] = </span><span style="color:#b48ead;">for </span><span>{
+</span><span>  </span><span style="color:#bf616a;">items </span><span>&lt;- Gen.listOfN(numberOfItems)(Gen.alphaNumericStringBounded(</span><span style="color:#d08770;">1</span><span>,</span><span style="color:#d08770;">5</span><span>))
+</span><span>  </span><span style="color:#bf616a;">prices </span><span>&lt;- Gen.listOfN(numberOfItems)(Gen.int(</span><span style="color:#d08770;">500</span><span>, </span><span style="color:#d08770;">20000</span><span>))
+</span><span>} </span><span style="color:#b48ead;">yield</span><span> items.zip(prices).toMap
+</span><span>
+</span><span style="color:#b48ead;">val </span><span style="color:#bf616a;">catalogueGen</span><span>: </span><span style="color:#ebcb8b;">Gen</span><span>[</span><span style="color:#b48ead;">Any</span><span>, </span><span style="color:#ebcb8b;">Catalogue</span><span>] = </span><span style="color:#b48ead;">for </span><span>{
+</span><span>  </span><span style="color:#bf616a;">version </span><span>&lt;- Gen.fromIterable(</span><span style="color:#d08770;">1</span><span> to </span><span style="color:#d08770;">10</span><span>)
+</span><span>  </span><span style="color:#bf616a;">numberOfItems </span><span>&lt;- Gen.fromIterable(</span><span style="color:#d08770;">1</span><span> to </span><span style="color:#d08770;">10</span><span>)
+</span><span>  </span><span style="color:#bf616a;">map </span><span>&lt;- mapGenerator(numberOfItems)
+</span><span>} </span><span style="color:#b48ead;">yield </span><span>Catalogue(version, map)
+</span></code></pre>
+<p>The above can generate Catalogue objects with version numbers between 1 and 10 and they can contain 1 to 10 items. Prices are between 500 and 20000, and the item names are just random alphanumeric characters.</p>
+<p>Let's see the implementation for the second test case:</p>
+<pre data-lang="scala" style="background-color:#2b303b;color:#c0c5ce;" class="language-scala "><code class="language-scala" data-lang="scala"><span style="color:#b48ead;">val </span><span style="color:#bf616a;">routesUnderTest </span><span>= Main.getCatalogueRouteWithETag.toRoutes
+</span><span>
+</span><span>test(&quot;</span><span style="color:#a3be8c;">when request DOES contain header &#39;If-None-Match&#39; and it is the same as the Etag of the response - we get back 304 and empty body</span><span>&quot;) {
+</span><span>  check(catalogueGen)(</span><span style="color:#bf616a;">catalogue </span><span style="color:#b48ead;">=&gt; </span><span>{
+</span><span>    </span><span style="color:#b48ead;">val </span><span style="color:#bf616a;">req </span><span>= Request.get(URL(Path.root./(&quot;</span><span style="color:#a3be8c;">catalogueWithETag</span><span>&quot;))).addHeader(Header.IfNoneMatch.parse(catalogue.version.toString).getOrElse(</span><span style="color:#b48ead;">???</span><span>))
+</span><span>    </span><span style="color:#b48ead;">for </span><span>{
+</span><span>      </span><span style="color:#bf616a;">ref </span><span>&lt;- Ref.make(catalogue)
+</span><span>      </span><span style="color:#bf616a;">app </span><span>= routesUnderTest.provideEnvironment(ZEnvironment(ref))
+</span><span>      </span><span style="color:#bf616a;">response </span><span>&lt;- app.runZIO(req)
+</span><span>    } </span><span style="color:#b48ead;">yield</span><span> assertTrue(response.status == Status.NotModified &amp;&amp; response.body.isEmpty)
+</span><span>  })
+</span><span>}
+</span></code></pre>
+<p>With the check function we generate a Catalogue object and then we create a request that contain the version of that object in the <strong>If-None-Match</strong> header. Later we inject that object wrapped in Ref into the routes we are testing. Then we can execute our request and assert two things:</p>
+<ul>
+<li>status code is 304</li>
+<li>response body is empty</li>
+</ul>
+<p>Later we annotate the test suite with</p>
+<pre data-lang="scala" style="background-color:#2b303b;color:#c0c5ce;" class="language-scala "><code class="language-scala" data-lang="scala"><span>TestAspect.samples(</span><span style="color:#d08770;">1000</span><span>)
+</span></code></pre>
+<p>so we can check the above behavior with 1000 Catalogue objects.</p>
+<p><a href="https://github.com/kurgansoft/etag-example/blob/master/src/test/scala/etag_demo/server/RouteTest.scala">Here</a> is the complete implementation with the other two scenarios.</p>
+<h1 id="conclusion">Conclusion</h1>
+<p>In this article, we explored high-level endpoints in zio-http, discussing their implementation on the server side and how to generate clients utilizing this technology.</p>
+<p>We employed ETags to enhance our polling solution, effectively reducing bandwidth usage.</p>
+<p>There are a couple of things we haven't looked at, like ETag in non-GET requests, sending multiple ETag values,
+and understanding the difference between strong and weak ETags.
+But hopefully you have managed to learn something, and adopt some ideas in your solution.</p>
+
+    </div>
+
+    
+        <footer>
+            <hr>
+            <p>
+                
+                
+                
+            </p>
+            
+            
+        </footer>
+    
+</article>
+
+
+    </body>
+
+</html>
